@@ -1,1 +1,48 @@
 name: H5 Gold Signal
+
+on:
+  schedule:
+    # Mon-Fri. The bot waits until 08:58 New York itself; two start times because GitHub sometimes starts late or
+    # skips a scheduled run. A second run while the first one is active waits in the queue and exits right away.
+    - cron: "10 12 * * 1-5"
+    - cron: "40 12 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Nur eine Testnachricht senden"
+        type: boolean
+        default: true
+
+concurrency:
+  group: h5-signal
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Test message
+        if: github.event_name == 'workflow_dispatch' && inputs.test
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python h5_bot.py --test
+      - name: Live run
+        if: github.event_name == 'schedule' || !inputs.test
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python -u h5_bot.py
+      - name: Save the day's log (also keeps the scheduled workflow active)
+        if: always() && (github.event_name == 'schedule' || !inputs.test)
+        run: |
+          git config user.name "h5-bot"
+          git config user.email "h5-bot@users.noreply.github.com"
+          git add logs 2>/dev/null || true
+          git diff --cached --quiet || (git commit -m "log $(date -u +%F)" && git push)
