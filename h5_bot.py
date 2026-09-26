@@ -9,6 +9,9 @@ gold_setups.silver_bullet_live(tp_r=0.5) and the TradingView indicator h5_silver
   target = entry +/- 0.5 x stop distance; invalid (side done) if the entry is not inside the range. Unfilled orders are
   cancelled at 11:00 NY; time exit with the close of the 11:59 NY bar. Both sides run at the same time, the first filled
   order counts, the other one is cancelled.
+Risk status: risk_status.json next to this file (written by the research repo's src/risk/engine.py, ADR-0030): allowed, lots,
+stage, reason. When H5 is paused, setups are sent as "nur Modell, kein Trade" with low priority; a status older than 14 days is
+flagged. Without the file the bot behaves as before (demo).
 Standard library only. Environment: NTFY_TOPIC (push channel; without it messages are only printed).
 Usage: python3 h5_bot.py            (live run for today)
        python3 h5_bot.py --test     (sends one test message and exits)
@@ -33,6 +36,8 @@ POLL_SECONDS = 4
 TP_R = 0.5
 COST = 0.42                       # USD per oz round trip at Tag Markets (spread 0.32 + commission 0.10)
 FEED_ALARM_SECONDS = 120
+RISK_FILE = Path(__file__).resolve().parent / "risk_status.json"
+RISK_STALE_DAYS = 14
 START_NY, END_NY = (8, 58), (12, 1)
 
 
@@ -184,20 +189,46 @@ class H5Live:
         return ev
 
 
-def message(e: Dict) -> Dict[str, str]:
-    """Push text (title, body, priority) for an event."""
+def load_risk(path: Path = RISK_FILE) -> Optional[Dict]:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def risk_line(risk: Optional[Dict], now: datetime) -> str:
+    if not risk:
+        return "Risk: kein Status (Demo)."
+    age = (now - datetime.fromisoformat(risk["updated_utc"].replace("Z", "+00:00"))).days
+    stale = f" Status {age} Tage alt - bitte Trades melden." if age > RISK_STALE_DAYS else ""
+    if risk.get("allowed", True):
+        return f"Risk: frei, {str(risk['lots']).replace('.', ',')} Lot ({risk['stage']}).{stale}"
+    return f"Risk: PAUSIERT ({risk['stage']}) - {risk.get('reason', '')}. Keine Orders.{stale}"
+
+
+def message(e: Dict, risk: Optional[Dict] = None) -> Dict[str, str]:
+    """Push text (title, body, priority) for an event, adjusted to the risk status."""
+    m = _message(e, risk)
+    if risk and not risk.get("allowed", True) and e["kind"] in ("pending", "fill", "cancel", "exit"):
+        m = {"title": m["title"] + " (nur Modell, kein Trade)", "priority": "low", "body": "H5 ist pausiert. " + m["body"]}
+    return m
+
+
+def _message(e: Dict, risk: Optional[Dict]) -> Dict[str, str]:
     t = e["t"]
     side = "Long" if e.get("side", 0) > 0 else "Short"
     if e["kind"] == "range":
         return {"title": "H5 Gold: Spanne steht", "priority": "default",
-                "body": f"09-10 NY: Hoch {fmt(e['high'])} / Tief {fmt(e['low'])}. Setup-Fenster {de_clock(t, 10, 0)}-{de_clock(t, 11, 0)} Uhr."}
+                "body": f"09-10 NY: Hoch {fmt(e['high'])} / Tief {fmt(e['low'])}. Setup-Fenster {de_clock(t, 10, 0)}-{de_clock(t, 11, 0)} Uhr. "
+                        + risk_line(risk, t)}
     if e["kind"] == "no_range":
         return {"title": "H5 Gold: heute kein Setup", "priority": "low",
                 "body": f"Nur {e['n']} von 60 Minuten Kursdaten fuer die Spanne 09-10 NY - heute keine Signale."}
     if e["kind"] == "pending":
         return {"title": f"H5 Gold: {e['order']} {fmt(e['entry'])}", "priority": "high",
-                "body": f"{e['order']} {fmt(e['entry'])} | SL {fmt(e['stop'])} | TP {fmt(e['target'])} | Stop {fmt(e['risk'])} $. "
-                        f"Gueltig bis {de_clock(t, 11, 0)} Uhr, dann loeschen."}
+                "body": f"{e['order']} {fmt(e['entry'])} | SL {fmt(e['stop'])} | TP {fmt(e['target'])} | Stop {fmt(e['risk'])} $"
+                        + (f" | {str(risk['lots']).replace('.', ',')} Lot" if risk and risk.get("allowed", True) else "")
+                        + f". Gueltig bis {de_clock(t, 11, 0)} Uhr, dann loeschen."}
     if e["kind"] == "fill":
         body = f"Modell-Order {e['order']} {fmt(e['entry'])} ausgeloest ({side})."
         if e["cancel"]:
@@ -290,13 +321,15 @@ def run(now: Callable[[], datetime] = lambda: datetime.now(timezone.utc), fetch:
         print(f"waiting {wait / 60:.0f} min until {start:%H:%M} NY", flush=True)
         sleep(wait)
     sm, bb = H5Live(), BarBuilder()
+    risk = load_risk()
+    log["risk"] = risk
     last_ok, alarmed = now(), False
 
     def handle(bar):
         log["bars"].append({**bar, "t": bar["t"].isoformat()})
         for e in sm.on_bar(bar["t"], bar["o"], bar["h"], bar["l"], bar["c"]):
             log["events"].append({k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in e.items()})
-            send(message(e))
+            send(message(e, risk))
 
     while True:
         t = now()
@@ -330,7 +363,7 @@ def run(now: Callable[[], datetime] = lambda: datetime.now(timezone.utc), fetch:
     last_px = log["bars"][-1]["c"] if log["bars"] else None
     for e in (sm.close_open_trade(now(), last_px) if last_px is not None else []):
         log["events"].append({k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in e.items()})
-        send(message(e))
+        send(message(e, risk))
     if log_dir is not None:
         log_dir.mkdir(exist_ok=True)
         (log_dir / f"{log['date_ny']}.json").write_text(json.dumps(log, indent=1, default=str))

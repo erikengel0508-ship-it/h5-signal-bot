@@ -19,6 +19,13 @@ In den Wochen, in denen Europa und die USA die Uhr zu unterschiedlichen Zeiten u
 Stunde. Die Nachrichten nennen immer die richtige deutsche Uhrzeit. Kommt bis 16:05 keine „Spanne“-Nachricht, ist der
 Lauf an dem Tag ausgefallen.
 
+## Risikostatus
+
+`risk_status.json` kommt aus der Risk Engine des Forschungs-Repositorys (wöchentlich nach dem Eintragen der tatsächlichen Trades):
+Stufe (DEMO, LIVE_MICRO, …), Lotgröße, frei/pausiert und Grund — ohne Kontozahlen. Ist H5 pausiert (z. B. 6 Verluste in Folge
+oder Verlustbudget ausgeschöpft), kommen Setups nur noch als „nur Modell, kein Trade“ mit niedriger Priorität. Die 16-Uhr-Nachricht
+nennt immer den aktuellen Risikostatus und warnt, wenn er älter als 14 Tage ist.
+
 ## Regel
 
 Spanne = Hoch/Tief 09:00–09:59 New York. Im Fenster 10:00–10:59 NY: Kurs unterschreitet das Tief (Long) bzw.
