@@ -12,6 +12,10 @@ gold_setups.silver_bullet_live(tp_r=0.5) and the TradingView indicator h5_silver
 Risk status: risk_status.json next to this file (written by the research repo's src/risk/engine.py, ADR-0030): allowed, lots,
 stage, reason. When H5 is paused, setups are sent as "nur Modell, kein Trade" with low priority; a status older than 14 days is
 flagged. Without the file the bot behaves as before (demo).
+News blackout (risk rule, ARCHITECTURE_V2 M2): if the public Forex Factory calendar lists a HIGH-impact USD release between 08:30
+and 11:59 New York on the day (it moves the 09-10 range or hits the setup window), the day's signals are sent as "nur Modell,
+Nachrichtensperre" — the model trade is still logged for the H5 evaluation. Calendar unreachable -> no blackout, the 16:00 message
+says so. Historically (sb_refinement_and_portfolio.py) skipping ISM/NFP/FOMC days changed little (+1.62 -> +1.80 bp per trade).
 Standard library only. Environment: NTFY_TOPIC (push channel; without it messages are only printed).
 Usage: python3 h5_bot.py            (live run for today)
        python3 h5_bot.py --test     (sends one test message and exits)
@@ -38,6 +42,8 @@ COST = 0.42                       # USD per oz round trip at Tag Markets (spread
 FEED_ALARM_SECONDS = 120
 RISK_FILE = Path(__file__).resolve().parent / "risk_status.json"
 RISK_STALE_DAYS = 14
+CALENDAR = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+BLACKOUT_NY = (8 * 60 + 30, 12 * 60)          # [08:30, 12:00) New York
 START_NY, END_NY = (8, 58), (12, 1)
 
 
@@ -196,11 +202,47 @@ def load_risk(path: Path = RISK_FILE) -> Optional[Dict]:
         return None
 
 
+def fetch_calendar(timeout: float = 15.0) -> List[Dict]:
+    req = urllib.request.Request(CALENDAR, headers={"User-Agent": "Mozilla/5.0 (h5-signal-bot)"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def blackout_events(calendar: List[Dict], day_ny) -> List[str]:
+    """HIGH-impact USD events on the New-York date day_ny between 08:30 and 11:59 NY, as 'HH:MM title'."""
+    out = []
+    for ev in calendar:
+        if ev.get("country") != "USD" or ev.get("impact") != "High":
+            continue
+        try:
+            t = datetime.fromisoformat(ev["date"]).astimezone(NY)
+        except (KeyError, ValueError):
+            continue
+        m = t.hour * 60 + t.minute
+        if t.date() == day_ny and BLACKOUT_NY[0] <= m < BLACKOUT_NY[1]:
+            out.append(f"{t:%H:%M} NY {ev.get('title', '')}")
+    return out
+
+
+def with_blackout(risk: Optional[Dict], events: Optional[List[str]]) -> Optional[Dict]:
+    """Risk status for the day incl. the news blackout (None events = calendar unavailable)."""
+    base = dict(risk) if risk else {"stage": "DEMO", "allowed": True, "lots": 0.01, "reason": "", "updated_utc": None}
+    base["calendar_ok"] = events is not None
+    if events:
+        base["allowed"] = False
+        base["reason"] = "Nachrichtensperre: " + ", ".join(events) + ("; " + risk["reason"] if risk and risk.get("reason") else "")
+    return base
+
+
 def risk_line(risk: Optional[Dict], now: datetime) -> str:
     if not risk:
         return "Risk: kein Status (Demo)."
-    age = (now - datetime.fromisoformat(risk["updated_utc"].replace("Z", "+00:00"))).days
-    stale = f" Status {age} Tage alt - bitte Trades melden." if age > RISK_STALE_DAYS else ""
+    stale = ""
+    if risk.get("updated_utc"):
+        age = (now - datetime.fromisoformat(risk["updated_utc"].replace("Z", "+00:00"))).days
+        stale = f" Status {age} Tage alt - bitte Trades melden." if age > RISK_STALE_DAYS else ""
+    if risk.get("calendar_ok") is False:
+        stale += " Wirtschaftskalender nicht abrufbar - keine Nachrichtensperre geprueft."
     if risk.get("allowed", True):
         return f"Risk: frei, {str(risk['lots']).replace('.', ',')} Lot ({risk['stage']}).{stale}"
     return f"Risk: PAUSIERT ({risk['stage']}) - {risk.get('reason', '')}. Keine Orders.{stale}"
@@ -210,7 +252,8 @@ def message(e: Dict, risk: Optional[Dict] = None) -> Dict[str, str]:
     """Push text (title, body, priority) for an event, adjusted to the risk status."""
     m = _message(e, risk)
     if risk and not risk.get("allowed", True) and e["kind"] in ("pending", "fill", "cancel", "exit"):
-        m = {"title": m["title"] + " (nur Modell, kein Trade)", "priority": "low", "body": "H5 ist pausiert. " + m["body"]}
+        m = {"title": m["title"] + " (nur Modell, kein Trade)", "priority": "low",
+             "body": f"H5 ist pausiert ({risk.get('reason', '')}). " + m["body"]}
     return m
 
 
@@ -306,7 +349,7 @@ class BarBuilder:
 
 def run(now: Callable[[], datetime] = lambda: datetime.now(timezone.utc), fetch: Callable[[], Optional[float]] = fetch_bid,
         send: Callable[[Dict[str, str]], None] = None, sleep: Callable[[float], None] = time.sleep,
-        log_dir: Optional[Path] = Path("logs")) -> Dict:
+        log_dir: Optional[Path] = Path("logs"), calendar: Callable[[], List[Dict]] = None) -> Dict:
     send = send or (lambda m: send_ntfy(m, os.environ.get("NTFY_TOPIC")))
     t = now()
     tn = t.astimezone(NY)
@@ -321,7 +364,12 @@ def run(now: Callable[[], datetime] = lambda: datetime.now(timezone.utc), fetch:
         print(f"waiting {wait / 60:.0f} min until {start:%H:%M} NY", flush=True)
         sleep(wait)
     sm, bb = H5Live(), BarBuilder()
-    risk = load_risk()
+    try:
+        events = blackout_events((calendar or fetch_calendar)(), tn.date())
+    except Exception as ex:                                    # noqa: BLE001
+        print(f"calendar unavailable: {ex}", flush=True)
+        events = None
+    risk = with_blackout(load_risk(), events)
     log["risk"] = risk
     last_ok, alarmed = now(), False
 

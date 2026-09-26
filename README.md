@@ -26,6 +26,12 @@ Stufe (DEMO, LIVE_MICRO, …), Lotgröße, frei/pausiert und Grund — ohne Kont
 oder Verlustbudget ausgeschöpft), kommen Setups nur noch als „nur Modell, kein Trade“ mit niedriger Priorität. Die 16-Uhr-Nachricht
 nennt immer den aktuellen Risikostatus und warnt, wenn er älter als 14 Tage ist.
 
+## Nachrichtensperre
+
+Steht im Wirtschaftskalender (Forex Factory, öffentlich) für den Tag ein **wichtiger US-Termin zwischen 08:30 und 11:59 New York**
+(z. B. ISM, Arbeitsmarkt, Inflation), kommen an diesem Tag keine Order-Signale, sondern nur „nur Modell, Nachrichtensperre: …“.
+Ist der Kalender nicht erreichbar, sagt die 16-Uhr-Nachricht das dazu.
+
 ## Regel
 
 Spanne = Hoch/Tief 09:00–09:59 New York. Im Fenster 10:00–10:59 NY: Kurs unterschreitet das Tief (Long) bzw.
