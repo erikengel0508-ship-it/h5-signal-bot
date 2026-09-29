@@ -26,6 +26,18 @@ Stufe (DEMO, LIVE_MICRO, …), Lotgröße, frei/pausiert und Grund — ohne Kont
 oder Verlustbudget ausgeschöpft), kommen Setups nur noch als „nur Modell, kein Trade“ mit niedriger Priorität. Die 16-Uhr-Nachricht
 nennt immer den aktuellen Risikostatus und warnt, wenn er älter als 14 Tage ist.
 
+## Mindest-Stop
+
+Setups mit einem Stopabstand **unter 2,10 USD** (das Fünffache der Kosten von 0,42 USD) kommen nur als „nur Modell, Stop zu eng“:
+Historisch brachten sie nichts (70 von 270 Trades, −0,01 USD/oz), weil Spread und Kommission rund 30 % des Risikos ausmachen.
+Das Ziel liegt immer bei halbem Stopabstand — mit der Regel also bei mindestens 1,05 USD.
+
+## Absicherung gegen abgebrochene Läufe
+
+Der Bot speichert seine Kerzen und Meldungen alle 10 Minuten und nach jedem Signal unter `logs/<Datum>.json`. Verliert GitHub den
+Rechner (wie am 2026-09-28), lädt der Ersatzlauf diesen Stand, rechnet den Tag ohne erneute Nachrichten nach und macht weiter
+(Meldung „Bot neu gestartet“).
+
 ## Nachrichtensperre
 
 Steht im Wirtschaftskalender (Forex Factory, öffentlich) für den Tag ein **wichtiger US-Termin zwischen 08:30 und 11:59 New York**

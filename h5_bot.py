@@ -16,6 +16,10 @@ News blackout (risk rule, ARCHITECTURE_V2 M2): if the public Forex Factory calen
 and 11:59 New York on the day (it moves the 09-10 range or hits the setup window), the day's signals are sent as "nur Modell,
 Nachrichtensperre" — the model trade is still logged for the H5 evaluation. Calendar unreachable -> no blackout, the 16:00 message
 says so. Historically (sb_refinement_and_portfolio.py) skipping ISM/NFP/FOMC days changed little (+1.62 -> +1.80 bp per trade).
+Minimum stop (risk rule, 2026-09-29): setups with a stop distance below 2.10 USD (5 x the 0.42 USD round-trip cost) are sent as
+"nur Modell, Stop zu eng" — historically they earned nothing (70 of 270 trades, -0.01 USD/oz) while costs were ~30 % of the risk.
+Checkpoints: on GitHub Actions the bot saves its bars and events to logs/<date>.json every 10 minutes and after each event (commit +
+push). A replacement run (after a lost runner) loads that file, replays the day without resending messages and continues.
 Standard library only. Environment: NTFY_TOPIC (push channel; without it messages are only printed).
 Usage: python3 h5_bot.py            (live run for today)
        python3 h5_bot.py --test     (sends one test message and exits)
@@ -44,6 +48,8 @@ RISK_FILE = Path(__file__).resolve().parent / "risk_status.json"
 RISK_STALE_DAYS = 14
 CALENDAR = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 BLACKOUT_NY = (8 * 60 + 30, 12 * 60)          # [08:30, 12:00) New York
+MIN_STOP_USD = 2.10                            # 5 x round-trip cost; risk_status.json may override ("min_stop_usd")
+CHECKPOINT_MINUTES = 10
 START_NY, END_NY = (8, 58), (12, 1)
 
 
@@ -123,7 +129,7 @@ class H5Live:
         for s in (self.L, self.S):
             if s.state == 2:
                 s.state = 3
-                ev.append({"kind": "cancel", "t": t, "side": s.dir, "order": s.order, "entry": s.level})
+                ev.append({"kind": "cancel", "t": t, "side": s.dir, "order": s.order, "entry": s.level, "risk": abs(s.level - s.stop)})
         return ev
 
     def close_open_trade(self, t, px: float) -> List[Dict]:
@@ -136,7 +142,8 @@ class H5Live:
         tr = self.trade
         net = tr["side"] * (px - tr["entry"]) - self.cost
         self.trade = None
-        return {"kind": "exit", "t": t, "side": tr["side"], "entry": tr["entry"], "exit": px, "reason": why, "net": net}
+        return {"kind": "exit", "t": t, "side": tr["side"], "entry": tr["entry"], "exit": px, "reason": why, "net": net,
+                "risk": abs(tr["entry"] - tr["stop"])}
 
     def on_bar(self, t: datetime, o: float, h: float, l: float, c: float) -> List[Dict]:
         ev: List[Dict] = []
@@ -169,7 +176,7 @@ class H5Live:
                 self.trade = {"side": w.dir, "entry": w.level, "stop": w.stop, "target": w.target, "bar": self.n}
                 self.traded = True
                 w.state = 4
-                ev.append({"kind": "fill", "t": t, "side": w.dir, "order": w.order, "entry": w.level,
+                ev.append({"kind": "fill", "t": t, "side": w.dir, "order": w.order, "entry": w.level, "risk": abs(w.level - w.stop),
                            "cancel": ({"order": other.order, "entry": other.level} if other.state == 2 else None)})
                 other.state = 3
             else:
@@ -251,9 +258,16 @@ def risk_line(risk: Optional[Dict], now: datetime) -> str:
 def message(e: Dict, risk: Optional[Dict] = None) -> Dict[str, str]:
     """Push text (title, body, priority) for an event, adjusted to the risk status."""
     m = _message(e, risk)
-    if risk and not risk.get("allowed", True) and e["kind"] in ("pending", "fill", "cancel", "exit"):
-        m = {"title": m["title"] + " (nur Modell, kein Trade)", "priority": "low",
-             "body": f"H5 ist pausiert ({risk.get('reason', '')}). " + m["body"]}
+    if e["kind"] not in ("pending", "fill", "cancel", "exit"):
+        return m
+    if risk and not risk.get("allowed", True):
+        return {"title": m["title"] + " (nur Modell, kein Trade)", "priority": "low",
+                "body": f"H5 ist pausiert ({risk.get('reason', '')}). " + m["body"]}
+    min_stop = (risk or {}).get("min_stop_usd", MIN_STOP_USD)
+    if e.get("risk") is not None and e["risk"] < min_stop:
+        return {"title": m["title"] + " (nur Modell, Stop zu eng)", "priority": "low",
+                "body": f"Stop {fmt(e['risk'])} $ < {fmt(min_stop)} $ - Kosten waeren ~{0.42 / e['risk']:.0%} des Risikos, historisch ohne Gewinn. "
+                        "Nicht handeln. " + m["body"]}
     return m
 
 
@@ -347,9 +361,51 @@ class BarBuilder:
         return bar
 
 
+def on_actions() -> bool:
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def _git(*args, timeout: float = 60) -> bool:
+    import subprocess
+    try:
+        return subprocess.run(["git", *args], timeout=timeout, capture_output=True).returncode == 0
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
+def sync_repo() -> None:
+    """On GitHub Actions: move the checkout to the newest main (a queued replacement run was checked out at trigger time)."""
+    if on_actions() and _git("fetch", "-q", "origin", "main"):
+        _git("reset", "-q", "--hard", "origin/main")
+
+
+def save_checkpoint(log: Dict, log_dir: Optional[Path], push: bool) -> None:
+    if log_dir is None:
+        return
+    log_dir.mkdir(exist_ok=True)
+    f = log_dir / f"{log['date_ny']}.json"
+    f.write_text(json.dumps(log, separators=(",", ":"), default=str))
+    if push:
+        who = ["-c", "user.name=h5-bot", "-c", "user.email=h5-bot@users.noreply.github.com"]
+        if _git("add", str(f)) and _git(*who, "commit", "-q", "-m", f"checkpoint {log['date_ny']} {len(log['bars'])} bars"):
+            if not _git("push", "-q", "origin", "HEAD:main"):              # main moved (e.g. a code push): rebase and retry once
+                _git(*who, "pull", "-q", "--rebase", "origin", "main")
+                _git("push", "-q", "origin", "HEAD:main")
+
+
+def load_checkpoint(log_dir: Optional[Path], date_ny: str) -> Optional[Dict]:
+    if log_dir is None:
+        return None
+    f = log_dir / f"{date_ny}.json"
+    try:
+        return json.loads(f.read_text())
+    except (OSError, ValueError):
+        return None
+
+
 def run(now: Callable[[], datetime] = lambda: datetime.now(timezone.utc), fetch: Callable[[], Optional[float]] = fetch_bid,
         send: Callable[[Dict[str, str]], None] = None, sleep: Callable[[float], None] = time.sleep,
-        log_dir: Optional[Path] = Path("logs"), calendar: Callable[[], List[Dict]] = None) -> Dict:
+        log_dir: Optional[Path] = Path("logs"), calendar: Callable[[], List[Dict]] = None, push: Optional[bool] = None) -> Dict:
     send = send or (lambda m: send_ntfy(m, os.environ.get("NTFY_TOPIC")))
     t = now()
     tn = t.astimezone(NY)
@@ -363,6 +419,9 @@ def run(now: Callable[[], datetime] = lambda: datetime.now(timezone.utc), fetch:
         wait = (start - tn).total_seconds()
         print(f"waiting {wait / 60:.0f} min until {start:%H:%M} NY", flush=True)
         sleep(wait)
+    push = on_actions() if push is None else push
+    if push:
+        sync_repo()
     sm, bb = H5Live(), BarBuilder()
     try:
         events = blackout_events((calendar or fetch_calendar)(), tn.date())
@@ -372,12 +431,28 @@ def run(now: Callable[[], datetime] = lambda: datetime.now(timezone.utc), fetch:
     risk = with_blackout(load_risk(), events)
     log["risk"] = risk
     last_ok, alarmed = now(), False
+    last_cp = {"minute": None}
+
+    prev = load_checkpoint(log_dir, log["date_ny"])
+    if prev and prev.get("bars"):
+        for b in prev["bars"]:                                  # replay silently: these messages were sent by the lost run
+            sm.on_bar(datetime.fromisoformat(b["t"]), b["o"], b["h"], b["l"], b["c"])
+        log["bars"], log["events"] = prev["bars"], prev.get("events", [])
+        log["resumed"] = log.get("resumed", 0) + 1
+        send({"title": "H5 Gold: Bot neu gestartet", "priority": "default",
+              "body": f"Vorheriger Lauf abgebrochen - Stand wiederhergestellt ({len(prev['bars'])} Kerzen bis "
+                      f"{datetime.fromisoformat(prev['bars'][-1]['t']).astimezone(DE):%H:%M} Uhr). Offene Orders selbst pruefen."})
 
     def handle(bar):
         log["bars"].append({**bar, "t": bar["t"].isoformat()})
-        for e in sm.on_bar(bar["t"], bar["o"], bar["h"], bar["l"], bar["c"]):
+        new = sm.on_bar(bar["t"], bar["o"], bar["h"], bar["l"], bar["c"])
+        for e in new:
             log["events"].append({k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in e.items()})
             send(message(e, risk))
+        m = ny_minute(bar["t"])
+        if new or (m % CHECKPOINT_MINUTES == 0 and last_cp["minute"] != m):
+            last_cp["minute"] = m
+            save_checkpoint(log, log_dir, push)
 
     while True:
         t = now()
@@ -412,9 +487,7 @@ def run(now: Callable[[], datetime] = lambda: datetime.now(timezone.utc), fetch:
     for e in (sm.close_open_trade(now(), last_px) if last_px is not None else []):
         log["events"].append({k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in e.items()})
         send(message(e, risk))
-    if log_dir is not None:
-        log_dir.mkdir(exist_ok=True)
-        (log_dir / f"{log['date_ny']}.json").write_text(json.dumps(log, indent=1, default=str))
+    save_checkpoint(log, log_dir, push)                       # final state (the workflow's last step then has nothing left to commit)
     print(f"done: {len(log['bars'])} bars, {len(log['events'])} events, {log['feed_errors']} feed errors", flush=True)
     return log
 
